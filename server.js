@@ -3,6 +3,7 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const mongoose = require("mongoose");
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -19,6 +20,51 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 
+// --- MongoDB Connection ---
+const MONGODB_URI = process.env.MONGODB_URI;
+
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('MongoDB connected successfully.'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+mongoose.connection.on('error', err => {
+  console.error(`MongoDB connection error: ${err}`);
+});
+// --- End MongoDB Connection ---
+
+// --- Mongoose Schemas and Models ---
+const scoreSchema = new mongoose.Schema({
+  correct: { type: Number, default: 0 },
+  incorrect: { type: Number, default: 0 }
+}, { _id: false }); // Prevent Mongoose from creating an _id for the subdocument
+
+const userSchema = new mongoose.Schema({
+  username: { type: String, required: true, unique: true, index: true },
+  score: { type: scoreSchema, default: () => ({ correct: 0, incorrect: 0 }) },
+  challengeId: { type: String, required: true, unique: true },
+  createdAt: { type: Date, default: Date.now },
+  lastActive: { type: Date, default: Date.now },
+  partyId: { type: String, default: null, index: true } // Index for faster party lookups
+});
+
+const partyMemberSchema = new mongoose.Schema({
+  username: { type: String, required: true },
+  score: { type: scoreSchema, default: () => ({ correct: 0, incorrect: 0 }) },
+  joinedAt: { type: Date, default: Date.now }
+}, { _id: false });
+
+const partySchema = new mongoose.Schema({
+  id: { type: String, required: true, unique: true, index: true }, // Use the crypto-generated ID
+  createdBy: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now },
+  members: [partyMemberSchema]
+});
+
+const User = mongoose.model('User', userSchema);
+const Party = mongoose.model('Party', partySchema);
+// --- End Mongoose Schemas and Models ---
+
+
 // Load destinations data
 const dataPath = path.join(__dirname, "data.json");
 let destinations = [];
@@ -29,9 +75,17 @@ try {
   console.error("Error reading or parsing data.json:", error);
 }
 
-// In-memory storage
-const users = new Map();
-const parties = new Map();
+
+
+app.get('/api/health', (req, res) => {
+  // Add CORS headers for the health endpoint
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Accept');
+  
+  res.status(200).json({ status: 'ok', message: 'Backend is running' });
+}); 
+
 
 // Endpoint to get a random destination with multiple choice options
 app.get("/api/destinations/random", (req, res) => {
@@ -84,182 +138,244 @@ app.post("/api/destinations/answer", (req, res) => {
 });
 
 // Endpoint to register a user or get existing user
-app.post("/api/users/register", (req, res) => {
-  const { username, partyId } = req.body;
-  
+app.post("/api/users/register", async (req, res, next) => { // Added async and next
+  const { username, partyId: requestedPartyId } = req.body; // Renamed partyId to avoid conflict
+
   if (!username || typeof username !== 'string' || username.trim().length === 0) {
     return res.status(400).json({ error: "Valid username is required" });
   }
 
-  const userId = crypto.randomUUID();
-  const challengeId = crypto.randomBytes(8).toString('hex');
-  
-  let user = users.get(username);
-  if (user) {
-    user.score = { correct: 0, incorrect: 0 };
-    user.lastActive = new Date();
-  } else {
-    user = {
-      id: userId,
-      username,
-      score: { correct: 0, incorrect: 0 },
-      challengeId,
-      createdAt: new Date(),
-      lastActive: new Date(),
-      partyId: null
-    };
-  }
-  
-  if (partyId && parties.has(partyId)) {
-    const party = parties.get(partyId);
-    if (!party.members.some(member => member.username === username)) {
-      party.members.push({
+  try {
+    let user = await User.findOne({ username });
+    let party = null;
+    let finalPartyId = null;
+
+    if (user) {
+      // User exists, reset score and update activity
+      user.score = { correct: 0, incorrect: 0 };
+      user.lastActive = new Date();
+      // Keep existing challengeId and partyId unless a new party is requested/created
+    } else {
+      // New user
+      const challengeId = crypto.randomBytes(8).toString('hex');
+      user = new User({
         username,
+        challengeId,
         score: { correct: 0, incorrect: 0 },
-        joinedAt: new Date()
+        lastActive: new Date(),
+        partyId: null // Will be set below if needed
       });
     }
-    user.partyId = partyId;
-  } else if (!partyId) {
-    const newPartyId = crypto.randomBytes(8).toString('hex');
-    const party = {
-      id: newPartyId,
-      createdBy: username,
-      createdAt: new Date(),
-      members: [{
-        username,
-        score: { correct: 0, incorrect: 0 },
-        joinedAt: new Date()
-      }]
+
+    // Handle party logic
+    if (requestedPartyId) {
+      party = await Party.findOne({ id: requestedPartyId });
+      if (party) {
+        // Add user to existing party if not already a member
+        const memberExists = party.members.some(member => member.username === username);
+        if (!memberExists) {
+          party.members.push({
+            username,
+            score: { correct: 0, incorrect: 0 }, // Initialize score in party
+            joinedAt: new Date()
+          });
+          await party.save();
+        }
+        finalPartyId = requestedPartyId;
+      } else {
+        // Requested party not found - potentially create a new one or handle error
+        // For now, let's ignore invalid requestedPartyId and proceed without a party
+        console.warn(`Requested party ID ${requestedPartyId} not found for user ${username}.`);
+        finalPartyId = null; // Ensure user isn't assigned to a non-existent party
+      }
+    } else if (!user.partyId) { // Only create a new party if user doesn't have one AND didn't request one
+      // Create a new party for the user
+      const newPartyId = crypto.randomBytes(8).toString('hex');
+      party = new Party({
+        id: newPartyId,
+        createdBy: username,
+        members: [{
+          username,
+          score: { correct: 0, incorrect: 0 },
+          joinedAt: new Date()
+        }]
+      });
+      await party.save();
+      finalPartyId = newPartyId;
+    } else {
+      // User exists and already has a partyId, or requested an invalid one
+      finalPartyId = user.partyId; // Keep existing party or null if request was invalid
+    }
+
+    user.partyId = finalPartyId; // Assign the determined party ID
+    await user.save(); // Save user (new or updated)
+
+    // Prepare response data
+    const responseData = {
+      username: user.username,
+      score: user.score,
+      challengeId: user.challengeId,
+      partyId: user.partyId
     };
-    parties.set(newPartyId, party);
-    user.partyId = newPartyId;
+
+    // Fetch party details again if a partyId is assigned
+    if (user.partyId) {
+       const currentParty = await Party.findOne({ id: user.partyId });
+       if (currentParty) {
+           responseData.party = {
+               id: currentParty.id,
+               createdBy: currentParty.createdBy,
+               members: currentParty.members
+           };
+       }
+    }
+
+    res.json(responseData);
+
+  } catch (error) {
+    console.error("Error during user registration:", error);
+    // Check for duplicate key errors (username or challengeId)
+    if (error.code === 11000) {
+        return res.status(409).json({ error: 'Username or challenge ID already exists.' });
+    }
+    next(error); // Pass other errors to the generic error handler
   }
-  
-  users.set(username, user);
-  
-  const responseData = {
-    username: user.username,
-    score: user.score,
-    challengeId: user.challengeId,
-    partyId: user.partyId
-  };
-  
-  if (user.partyId && parties.has(user.partyId)) {
-    const party = parties.get(user.partyId);
-    responseData.party = {
-      id: user.partyId,
-      createdBy: party.createdBy,
-      members: party.members
-    };
-  }
-  
-  res.json(responseData);
 });
 
 // Get user by challenge ID
-app.get("/api/users/challenge/:challengeId", (req, res) => {
+app.get("/api/users/challenge/:challengeId", async (req, res, next) => { // Added async and next
   const { challengeId } = req.params;
-  
-  let targetUser = null;
-  for (const user of users.values()) {
-    if (user.challengeId === challengeId) {
-      targetUser = user;
-      break;
-    }
-  }
 
-  if (!targetUser) {
-    return res.status(404).json({ error: "Challenge not found" });
-  }
-  
-  const response = {
-    username: targetUser.username,
-    score: targetUser.score,
-    challengeId: targetUser.challengeId
-  };
-  
-  if (targetUser.partyId) {
-    const party = parties.get(targetUser.partyId);
-    if (party) {
-      response.party = {
-        id: targetUser.partyId,
-        createdBy: party.createdBy,
-        members: party.members
-      };
+  try {
+    const targetUser = await User.findOne({ challengeId });
+
+    if (!targetUser) {
+      return res.status(404).json({ error: "Challenge not found" });
     }
+
+    const response = {
+      username: targetUser.username,
+      score: targetUser.score,
+      challengeId: targetUser.challengeId,
+      partyId: targetUser.partyId // Include partyId
+    };
+
+    if (targetUser.partyId) {
+      const party = await Party.findOne({ id: targetUser.partyId });
+      if (party) {
+        response.party = {
+          id: party.id, // Use party.id which is the unique string ID
+          createdBy: party.createdBy,
+          members: party.members
+        };
+      } else {
+         console.warn(`Party ${targetUser.partyId} not found for user ${targetUser.username} during challenge lookup.`);
+         // Optionally clear the user's partyId if it's invalid
+         // targetUser.partyId = null;
+         // await targetUser.save();
+      }
+    }
+
+    res.json(response);
+  } catch (error) {
+    console.error("Error fetching user by challenge ID:", error);
+    next(error);
   }
-  
-  res.json(response);
 });
 
 // Get party info
-app.get("/api/parties/:partyId", (req, res) => {
+app.get("/api/parties/:partyId", async (req, res, next) => { // Added async and next
   const { partyId } = req.params;
-  
-  if (!parties.has(partyId)) {
-    return res.status(404).json({ error: "Party not found" });
+
+  try {
+    const party = await Party.findOne({ id: partyId }); // Find by the custom 'id' field
+
+    if (!party) {
+      return res.status(404).json({ error: "Party not found" });
+    }
+
+    res.json({
+      id: party.id,
+      createdBy: party.createdBy,
+      createdAt: party.createdAt,
+      members: party.members
+    });
+  } catch (error) {
+    console.error("Error fetching party info:", error);
+    next(error);
   }
-  
-  const party = parties.get(partyId);
-  
-  res.json({
-    id: party.id,
-    createdBy: party.createdBy,
-    createdAt: party.createdAt,
-    members: party.members
-  });
 });
 
 // Update user score
-app.put("/api/users/:username/score", (req, res) => {
+app.put("/api/users/:username/score", async (req, res, next) => { // Added async and next
   const { username } = req.params;
-  const { correct } = req.body;
-  
-  if (!users.has(username)) {
-    return res.status(404).json({ error: "User not found" });
+  const { correct } = req.body; // Expecting { correct: boolean }
+
+  if (typeof correct !== 'boolean') {
+      return res.status(400).json({ error: "Invalid request body: 'correct' field (boolean) is required." });
   }
 
-  const user = users.get(username);
-  
-  if (correct) {
-    user.score.correct += 1;
-  } else {
-    user.score.incorrect += 1;
-  }
+  try {
+    const user = await User.findOne({ username });
 
-  users.set(username, user);
-  
-  // Update user's score in any party they belong to
-  if (user.partyId && parties.has(user.partyId)) {
-    const party = parties.get(user.partyId);
-    const memberIndex = party.members.findIndex(m => m.username === username);
-    
-    if (memberIndex !== -1) {
-      if (correct) {
-        party.members[memberIndex].score.correct += 1;
-      } else {
-        party.members[memberIndex].score.incorrect += 1;
-      }
-      parties.set(user.partyId, party);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
     }
+
+    // Update user score
+    if (correct) {
+      user.score.correct += 1;
+    } else {
+      user.score.incorrect += 1;
+    }
+    user.lastActive = new Date(); // Update activity timestamp
+    await user.save();
+
+    let partyData = null;
+    // Update user's score in their party, if they belong to one
+    if (user.partyId) {
+      const party = await Party.findOne({ id: user.partyId });
+      if (party) {
+        const memberIndex = party.members.findIndex(m => m.username === username);
+        if (memberIndex !== -1) {
+          if (correct) {
+            party.members[memberIndex].score.correct += 1;
+          } else {
+            party.members[memberIndex].score.incorrect += 1;
+          }
+          // Mark members array as modified for Mongoose to save the change
+          party.markModified('members');
+          await party.save();
+          partyData = { // Prepare party data for response
+              id: party.id,
+              members: party.members
+          };
+        } else {
+             console.warn(`User ${username} found in party ${user.partyId} document, but not in members array.`);
+        }
+      } else {
+          console.warn(`Party ${user.partyId} not found for user ${username} during score update.`);
+          // Optionally clear the user's partyId if it's invalid
+          // user.partyId = null;
+          // await user.save();
+      }
+    }
+
+    const response = { score: user.score };
+    if (partyData) {
+        response.party = partyData; // Include updated party data in response
+    }
+
+    res.json(response);
+
+  } catch (error) {
+    console.error("Error updating user score:", error);
+    next(error);
   }
-  
-  const response = { score: user.score };
-  
-  // Include party data if user is in a party
-  if (user.partyId && parties.has(user.partyId)) {
-    response.party = {
-      id: user.partyId,
-      members: parties.get(user.partyId).members
-    };
-  }
-  
-  res.json(response);
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
+// Error handling middleware - Keep this generic one
+app.use((err, req, res, next) => { // Ensure 'next' is included
   console.error(err.stack);
   res.status(500).json({ error: 'Something went wrong!' });
 });
